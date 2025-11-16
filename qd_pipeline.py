@@ -1,125 +1,110 @@
-# qd_pipeline.py — Clean version with optional doping support (metadata only)
-
+# qd_pipeline.py — Hybrid ML + Physics Doping Model
 import numpy as np
 import pandas as pd
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.pipeline import Pipeline
-
+from sklearn.compose import ColumnTransformer
+import joblib
 
 class QDSystem:
-    """
-    Machine-learning system for quantum-dot bandgap prediction.
-    - Uses KNN regression.
-    - Inputs: material, radius, epsilon_r, crystal_structure.
-    - Doping fields are accepted but not used in the ML model (metadata only).
-    """
-
     def __init__(self):
         self.model = None
-        self.material_encoder = {}
-        self.crystal_encoder = {}
+        self.encoder = None
+        self.pipeline = None
 
-    # -------------------------------
-    # Utility encoders
-    # -------------------------------
-    def encode_material(self, material: str) -> int:
-        material = material.strip()
-        if material not in self.material_encoder:
-            self.material_encoder[material] = len(self.material_encoder)
-        return self.material_encoder[material]
-
-    def encode_crystal(self, crys: str) -> int:
-        crys = crys.strip()
-        if crys not in self.crystal_encoder:
-            self.crystal_encoder[crys] = len(self.crystal_encoder)
-        return self.crystal_encoder[crys]
-
-    # -------------------------------
-    # Fit model
-    # -------------------------------
+    # ---------------------- TRAIN ----------------------
     def fit(self, df: pd.DataFrame):
-        # Expecting columns:
-        # ['material','radius_nm','epsilon_r','crystal_structure','band_gap_eV']
+        df = df.copy()
 
-        df = df.dropna(subset=["material","radius_nm","epsilon_r",
-                               "crystal_structure","band_gap_eV"])
+        X = df[["material", "radius_nm", "epsilon_r", "crystal_structure"]]
+        y = df["band_gap_eV"]
 
-        X = []
-        y = []
+        cat_cols = ["material", "crystal_structure"]
+        num_cols = ["radius_nm", "epsilon_r"]
 
-        for _, row in df.iterrows():
-            X.append([
-                self.encode_material(row["material"]),
-                float(row["radius_nm"]),
-                float(row["epsilon_r"]),
-                self.encode_crystal(row["crystal_structure"])
-            ])
-            y.append(float(row["band_gap_eV"]))
+        pre = ColumnTransformer(
+            [
+                ("cat", OneHotEncoder(handle_unknown='ignore'), cat_cols),
+                ("num", "passthrough", num_cols),
+            ]
+        )
 
-        X = np.array(X, dtype=float)
-        y = np.array(y, dtype=float)
+        self.pipeline = Pipeline(
+            steps=[
+                ("pre", pre),
+                ("model", RandomForestRegressor(n_estimators=600, random_state=42)),
+            ]
+        )
 
-        # ML pipeline: scale → KNN
-        self.model = Pipeline([
-            ("scaler", StandardScaler()),
-            ("knn", KNeighborsRegressor(n_neighbors=5))
-        ])
+        self.pipeline.fit(X, y)
 
-        self.model.fit(X, y)
+    # ---------------------- BASE PREDICTION ----------------------
+    def predict_base(self, material, radius_nm, epsilon_r, crystal_structure):
+        X = pd.DataFrame([{
+            "material": material,
+            "radius_nm": float(radius_nm),
+            "epsilon_r": float(epsilon_r),
+            "crystal_structure": crystal_structure
+        }])
+        return float(self.pipeline.predict(X)[0])
 
-    # -------------------------------
-    # Predict Band Gap
-    # -------------------------------
+    # ---------------------- DOPING PHYSICS MODEL ----------------------
+    def doping_shift(self, dopant, doping_type, conc):
+        """
+        Adds physical correction to band gap.
+        conc is in cm^-3.
+        """
+
+        if not dopant or not doping_type or conc is None or conc <= 0:
+            return 0.0
+
+        dopant = dopant.capitalize()
+
+        # Typical dopant band edge effects (eV)
+        dopant_strength = {
+            "B": -0.12, "N": +0.18, "P": +0.15, "As": +0.22,
+            "Al": +0.05, "Ga": +0.07, "In": +0.03,
+            "Mn": -0.25, "Cu": -0.18, "Fe": -0.30,
+            "Cl": +0.10, "Br": +0.12, "I": +0.15,
+        }
+
+        base = dopant_strength.get(dopant, 0.0)
+
+        # n-type increases conduction band, p-type decreases valence band
+        if doping_type == "n":
+            direction = +1
+        else:
+            direction = -1
+
+        # Normalize concentration effect
+        factor = np.log10(conc) - 17
+        factor = max(min(factor, 3), -3)  # clamp
+
+        return base * direction * (factor * 0.25)
+
+    # ---------------------- FINAL PREDICTION ----------------------
     def predict_bandgap(self, material, radius_nm, epsilon_r, crystal_structure,
                         dopant=None, doping_type=None, doping_conc_cm3=None):
-        """
-        Doping fields are accepted but *not used* in the ML model.
-        They can be integrated later for physics-based corrections.
-        """
 
-        X = np.array([[
-            self.encode_material(material),
-            float(radius_nm),
-            float(epsilon_r),
-            self.encode_crystal(crystal_structure)
-        ]], dtype=float)
+        Eg0 = self.predict_base(material, radius_nm, epsilon_r, crystal_structure)
 
-        return float(self.model.predict(X)[0])
+        shift = self.doping_shift(dopant, doping_type, doping_conc_cm3)
+        return float(Eg0 + shift)
 
-    # -------------------------------
-    # Inverse: Suggest materials for a target bandgap
-    # -------------------------------
-    def suggest_materials_from_bandgap(self, target_Eg, radius_nm, epsilon_r,
+    # ---------------------- INVERSE SEARCH ----------------------
+    def suggest_materials_from_bandgap(self, target, radius_nm, epsilon_r,
                                        crystal_structure, top_k=3):
-        """
-        Find the closest materials in dataset space w.r.t predicted bandgap.
-        """
 
-        # Generate search set: every known material
-        mats = list(self.material_encoder.keys())
+        # We search inside the known dataset only
+        df = pd.read_csv("qd_data.csv")
+        df["pred"] = df.apply(
+            lambda r: self.predict_base(r["material"], r["radius_nm"],
+                                        r["epsilon_r"], r["crystal_structure"]),
+            axis=1
+        )
 
-        scored = []
-        for mat in mats:
-            pred = self.predict_bandgap(mat, radius_nm, epsilon_r, crystal_structure)
-            score = 1 / (1 + abs(pred - target_Eg))  # similarity
-            scored.append((mat, score))
+        df["score"] = 1 / (1 + abs(df["pred"] - target))
+        top = df.sort_values("score", ascending=False).head(top_k)
 
-        # Sort descending by score
-        scored = sorted(scored, key=lambda x: x[1], reverse=True)
-        topk = scored[:top_k]
-
-        # Produce a small nearest-neighbor dataframe for display
-        nn_rows = []
-        for mat, sc in topk:
-            pred = self.predict_bandgap(mat, radius_nm, epsilon_r, crystal_structure)
-            nn_rows.append({
-                "material": mat,
-                "band_gap_eV": pred,
-                "radius_nm": radius_nm,
-                "epsilon_r": epsilon_r,
-                "crystal_structure": crystal_structure
-            })
-
-        nn_df = pd.DataFrame(nn_rows)
-        return topk, nn_df
+        return [(row.material, float(row.score)) for _, row in top.iterrows()], top
