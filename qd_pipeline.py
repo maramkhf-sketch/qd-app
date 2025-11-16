@@ -1,76 +1,102 @@
-# qd_pipeline.py
+# qd_pipeline.py — Hybrid QD System (CSV + Brus + Optional Doping)
 
 import numpy as np
 import pandas as pd
-from joblib import load
 
 class QDSystem:
-    def __init__(self, csv_path="qd_data.csv"):
-        self.df = pd.read_csv(csv_path)
+    def __init__(self, df):
+        """
+        df MUST contain:
+        material, band_gap_eV, radius_nm, epsilon_r, crystal_structure
+        """
+        self.df = df
 
-        # مواد النظام الأساسية
-        self.materials = sorted(self.df["material"].unique())
+    # -------------------------------------------------------
+    # PHYSICAL BRUS EQUATION (BASELINE ESTIMATE)
+    # -------------------------------------------------------
+    def brus_bandgap(self, Eg_bulk, radius_nm, eps_r):
+        """
+        Simplified Brus equation
+        Used when user picks any material (CSV based)
+        """
+        r = radius_nm * 1e-9  # nm → m
+        h2 = (6.626e-34)**2 / (2 * 9.11e-31)  
+        confinement = h2 * (np.pi**2) / (r**2)
+        coulomb = 1.8 * (1.6e-19)**2 / (4 * np.pi * 8.85e-12 * eps_r * r)
 
-        # ماب للكرستال
-        self.crystal_map = {"ZB": 0, "WZ": 1}
+        Eg = Eg_bulk + confinement / 1.6e-19 - coulomb / 1.6e-19
+        return float(Eg)
 
-    # -------------------------------
-    # 1) أقرب مادة إذا اليوزر كتب مادة غير موجودة
-    # -------------------------------
-    def find_closest_material(self, user_material):
-        user_material = user_material.strip().lower()
-        best = None
-        best_score = -1
+    # -------------------------------------------------------
+    # OPTIONAL DOPING SHIFT
+    # -------------------------------------------------------
+    def apply_doping(self, Eg, dopant, dop_type, conc):
+        """
+        Toy physics model:
+        - Doping shift is weak (0.01–0.15 eV depending on concentration)
+        - Only applied when user enters doping values
+        """
+        if dopant.strip() == "" or dop_type == "None" or conc == 0:
+            return Eg   # no doping
 
-        for m in self.materials:
-            score = sum(a == b for a, b in zip(m.lower(), user_material))
-            if score > best_score:
-                best_score = score
-                best = m
-        return best
+        # Convert cm^-3 → scaled shift
+        scale = min(conc / 1e20, 1.0)  # avoid insane values
+        shift = 0.10 * scale           # 0 → 0.1 eV
 
-    # -------------------------------
-    # 2) الباند جاب الأساسي من الملف
-    # -------------------------------
-    def get_base_bandgap(self, material):
-        row = self.df[self.df["material"] == material]
-        if row.empty:
-            material = self.find_closest_material(material)
-            row = self.df[self.df["material"] == material]
-        return float(row["band_gap_eV"].values[0])
+        if dop_type == "n-type":
+            Eg = Eg - shift
+        elif dop_type == "p-type":
+            Eg = Eg + shift
 
-    # -------------------------------
-    # 3) تأثير الدوبنق
-    # -------------------------------
-    def doping_shift(self, dopant, doping_type, concentration):
-        if dopant.strip() == "":
-            return 0.0
+        return float(Eg)
 
-        concentration = max(float(concentration), 0)
+    # -------------------------------------------------------
+    # GET BULK Eg FROM CSV
+    # -------------------------------------------------------
+    def get_bulk_Eg(self, material):
+        df_mat = self.df[self.df["material"] == material]
+        if len(df_mat) == 0:
+            # fallback: mean Eg
+            return float(self.df["band_gap_eV"].mean())
+        return float(df_mat["band_gap_eV"].mean())
 
-        if doping_type == "n-type":
-            return 0.04 * np.log10(concentration + 1)
-        elif doping_type == "p-type":
-            return -0.04 * np.log10(concentration + 1)
-        return 0.0
+    # -------------------------------------------------------
+    # FORWARD PREDICTION
+    # -------------------------------------------------------
+    def predict_forward(self, material, radius_nm, eps_r, cryst, dopant, dop_type, conc):
 
-    # -------------------------------
-    # 4) معادلة Brus + الدوبنق
-    # -------------------------------
-    def predict_bandgap(self, material, radius_nm, eps_r, crystal_structure,
-                        dopant="", doping_type="", concentration=0):
+        Eg_bulk = self.get_bulk_Eg(material)
 
-        material = material if material in self.materials else self.find_closest_material(material)
+        # baseline Brus physics
+        Eg = self.brus_bandgap(Eg_bulk, radius_nm, eps_r)
 
-        base_Eg = self.get_base_bandgap(material)
+        # doping correction
+        Eg = self.apply_doping(Eg, dopant, dop_type, conc)
 
-        r = float(radius_nm) * 1e-9
-        e2 = 1.44
-        eff_mass = 0.13
+        return Eg
 
-        brus = base_Eg + ((np.pi ** 2) * (6.626e-34**2)) / (2 * eff_mass * 9.11e-31 * r**2) \
-               - (1.8 * e2)/(eps_r * r * 1e9)
+    # -------------------------------------------------------
+    # INVERSE PREDICTION
+    # -------------------------------------------------------
+    def inverse_predict(self, target_eg):
+        """
+        Return nearest materials from CSV based on band gap proximity
+        """
+        df = self.df.copy()
+        df["difference"] = abs(df["band_gap_eV"] - target_eg)
+        df_sorted = df.sort_values("difference").head(5)
 
-        delta = self.doping_shift(dopant, doping_type, concentration)
+        return df_sorted[["material", "band_gap_eV", "radius_nm", "epsilon_r", "crystal_structure"]]
 
-        return float(brus + delta)
+    # -------------------------------------------------------
+    # CURVE PLOT
+    # -------------------------------------------------------
+    def plot_curve(self, material, eps_r, cryst):
+        radii = np.linspace(1, 10, 40)
+        Eg_bulk = self.get_bulk_Eg(material)
+
+        Eg_curve = [
+            self.brus_bandgap(Eg_bulk, r, eps_r)
+            for r in radii
+        ]
+        return radii, Eg_curve
