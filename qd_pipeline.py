@@ -1,110 +1,79 @@
-# qd_pipeline.py
 import numpy as np
 import pandas as pd
-
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 
 class QDSystem:
-    def __init__(self, csv_path="qd_data.csv"):
-        self.df = pd.read_csv(csv_path)
+    def __init__(self):
+        self.scaler = None
+        self.nn = None
+        self.df = None
 
-        # Normalize column names
-        self.df.columns = [c.strip().lower() for c in self.df.columns]
+    def fit(self, df):
+        """Train the model using the 700-row dataset."""
+        self.df = df.copy()
 
-        # Required columns
-        required_cols = ["material", "band_gap_ev", "radius_nm", "epsilon_r", "crystal_structure"]
-        for c in required_cols:
-            if c not in self.df.columns:
-                raise ValueError(f"CSV missing column: {c}")
+        # Features for ML
+        X = df[["radius_nm", "epsilon_r"]].astype(float)
 
-        # Precompute materials → baseline properties lookup
-        self.material_props = {
-            row["material"].strip(): {
-                "band_gap": row["band_gap_ev"],
-                "eps": row["epsilon_r"],
-                "radius": row["radius_nm"],
-                "crystal": row["crystal_structure"]
-            }
-            for _, row in self.df.iterrows()
-        }
+        self.scaler = StandardScaler()
+        Xs = self.scaler.fit_transform(X)
 
-    # ---------------------------------------------------------
-    # Helper: nearest known radius & Eg interpolation
-    # ---------------------------------------------------------
-    def predict_base_bandgap(self, material, radius_nm):
-        """Interpolates Eg vs radius for known material."""
-        sub = self.df[self.df["material"] == material]
+        self.nn = NearestNeighbors(n_neighbors=3)
+        self.nn.fit(Xs)
 
-        if len(sub) < 2:
-            # No data, just return baseline
-            return self.material_props[material]["band_gap"]
+    def _nearest_bandgap(self, radius_nm, epsilon_r):
+        """Return weighted bandgap based on nearest materials in dataset."""
+        Xq = np.array([[radius_nm, epsilon_r]])
+        Xq = self.scaler.transform(Xq)
 
-        # Sort by radius
-        sub = sub.sort_values("radius_nm")
+        dist, idx = self.nn.kneighbors(Xq)
+        dist = dist[0]
+        idx = idx[0]
 
-        # Interpolate Eg for given radius
-        return np.interp(
-            radius_nm,
-            sub["radius_nm"].values,
-            sub["band_gap_ev"].values
-        )
+        weights = 1 / (dist + 1e-6)
+        weights = weights / weights.sum()
 
-    # ---------------------------------------------------------
-    # Dopant Effect — simple physically-correct linear shift
-    # ---------------------------------------------------------
-    def apply_doping(self, eg, dopant, dtype, conc):
+        bg = (self.df.iloc[idx]["band_gap_eV"].values * weights).sum()
+        return float(bg)
+
+    def predict_bandgap(self, material, radius_nm, epsilon_r, crystal_structure,
+                        dopant=None, doping_type=None, doping_conc=None):
         """
-        dopant: element symbol string or "" if empty
-        dtype: n-type / p-type
-        conc: concentration cm^-3
+        Hybrid model:
+        - Always uses radius + epsilon_r + ML for base band gap
+        - If doping exists → apply physics correction
         """
-        if dopant == "" or conc <= 0:
-            return eg  # no doping
+        bg = self._nearest_bandgap(radius_nm, epsilon_r)
 
-        # Small shift model — simple + stable
-        dopant_strength = 0.000000001 * conc  # 1e-9 * conc
+        # --- Physics Correction for doping (OPTIONAL) ---
+        if dopant and doping_type and doping_conc and doping_conc > 0:
+            # Normalize concentration (cm^-3 → dimensionless)
+            C = float(doping_conc) / 1e18
 
-        if dtype == "n-type":
-            eg = eg - dopant_strength
-        elif dtype == "p-type":
-            eg = eg + dopant_strength
+            if doping_type == "n":
+                bg -= 0.05 * C
+            elif doping_type == "p":
+                bg += 0.05 * C
 
-        return max(0.01, eg)
+            # Prevent negative Eg
+            bg = max(bg, 0.01)
 
-    # ---------------------------------------------------------
-    # Full forward prediction
-    # ---------------------------------------------------------
-    def predict(self, material, radius_nm, dopant="", dop_type="", conc=0):
-        if material not in self.material_props:
-            # If unknown → nearest material
-            return np.nan
+        return float(bg)
 
-        # Step 1 — baseline band gap
-        base_eg = self.predict_base_bandgap(material, radius_nm)
+    def suggest_materials_from_bandgap(self, target, radius_nm, epsilon_r,
+                                       crystal_structure, top_k=3):
+        """Inverse Prediction: Suggest closest materials."""
+        Xq = np.array([[radius_nm, epsilon_r]])
+        Xq = self.scaler.transform(Xq)
 
-        # Step 2 — doping correction
-        final_eg = self.apply_doping(base_eg, dopant, dop_type, conc)
+        dist, idx = self.nn.kneighbors(Xq)
+        idx = idx[0]
 
-        return round(float(final_eg), 4)
+        df_hits = self.df.iloc[idx].copy()
+        df_hits["score"] = 1 - abs(df_hits["band_gap_eV"] - target) / max(target, 1e-3)
 
-    # ---------------------------------------------------------
-    # Inverse: Suggest materials for target Eg
-    # ---------------------------------------------------------
-    def suggest_materials(self, target_eg, top_k=3):
-        diffs = []
-        for m in self.material_props:
-            eg0 = self.material_props[m]["band_gap"]
-            diffs.append((m, abs(eg0 - target_eg)))
+        df_hits = df_hits.sort_values("score", ascending=False).head(top_k)
+        top_list = [(row["material"], float(row["score"])) for _, row in df_hits.iterrows()]
 
-        diffs.sort(key=lambda x: x[1])
-        return [d[0] for d in diffs[:top_k]]
-
-    # ---------------------------------------------------------
-    # Curve: Eg vs radius
-    # ---------------------------------------------------------
-    def generate_curve(self, material, start=1, end=10, step=0.2):
-        if material not in self.material_props:
-            return [], []
-
-        radii = np.arange(start, end + step, step)
-        egs = [self.predict(material, r) for r in radii]
-        return radii, egs
+        return top_list, df_hits

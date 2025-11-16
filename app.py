@@ -1,233 +1,245 @@
-import streamlit as st
-import requests
+# app.py — Quantum Dot Band Gap Predictor (GPT Chat + Form + Forward + Inverse + Curve + Doping)
+
+import os
+import re
 import json
-import pandas as pd
-import numpy as np
-import joblib
 from pathlib import Path
-from qd_pipeline import QDSystem
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+import joblib
 
+from qd_pipeline import QDSystem   # ← مهم
 
-# =============================
-# 1) PAGE CONFIG
-# =============================
+# ==================== OPENAI CLIENT ====================
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+    except:
+        client = None
 
+# ==================== PAGE CONFIG ====================
 st.set_page_config(
     page_title="Quantum Dot Band Gap Predictor",
-    layout="centered",
+    page_icon="🧠",
+    layout="centered"
 )
 
 st.title("🧠 Quantum Dot Band Gap Predictor")
 
 HERE = Path(__file__).parent.resolve()
-DATA_CSV = HERE / "qd_data.csv"
+DATA_FILE = HERE / "qd_data.csv"
+MODEL_FILE = HERE / "qd_system.joblib"
 
-
-# =============================
-# 2) LOAD SYSTEM
-# =============================
-
-@st.cache_resource
+# ==================== LOAD / TRAIN MODEL ====================
+@st.cache_resource(show_spinner=True)
 def load_system():
-    df = pd.read_csv(DATA_CSV)
+    if MODEL_FILE.exists():
+        return joblib.load(MODEL_FILE)
+
+    df = pd.read_csv(DATA_FILE)
     sys = QDSystem()
     sys.fit(df)
+    joblib.dump(sys, MODEL_FILE)
     return sys
 
 system = load_system()
 
-
-# =============================
-# 3) GPT SETUP
-# =============================
-
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
-
-def call_gpt(messages):
-    """
-    Calls GPT-4o-mini through OpenAI API for chat.
-    """
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
+# ==================== HELPER (LOCAL PARSER) ====================
+def parse_local(text):
+    out = {
+        "material": None,
+        "radius_nm": None,
+        "epsilon_r": None,
+        "crystal_structure": None,
+        "dopant": None,
+        "doping_type": None,
+        "doping_conc": None
     }
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": messages
-    }
-    r = requests.post(url, headers=headers, data=json.dumps(payload))
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
 
+    if not text:
+        return out
 
-# =============================
-# 4) CHAT SECTION (ALWAYS ON TOP)
-# =============================
+    m = re.search(r"\b([A-Z][a-zA-Z0-9]*)\b", text)
+    if m:
+        out["material"] = m.group(1)
 
-st.subheader("💬 Chat with the Predictor")
+    m = re.search(r"(\d+(\.\d+)?)\s*nm", text)
+    if m:
+        out["radius_nm"] = float(m.group(1))
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = [
-        {"role": "assistant", "content": "Hi! How can I help you with quantum dots today?"}
-    ]
+    m = re.search(r"(?:εr|er|epsilon)\s*=?\s*(\d+(\.\d+)?)", text)
+    if m:
+        out["epsilon_r"] = float(m.group(1))
 
-# --- Chat history display ---
-for msg in st.session_state.chat_history:
-    if msg["role"] == "user":
-        st.write(f"**You:** {msg['content']}")
+    for key in ["ZB", "WZ", "Rocksalt", "Perovskite", "Rutile"]:
+        if re.search(key, text, re.IGNORECASE):
+            out["crystal_structure"] = key
+            break
+
+    if "n-type" in text.lower():
+        out["doping_type"] = "n"
+    if "p-type" in text.lower():
+        out["doping_type"] = "p"
+
+    m = re.search(r"doped with ([A-Za-z]+)", text.lower())
+    if m:
+        out["dopant"] = m.group(1).capitalize()
+
+    m = re.search(r"(\d+(\.\d+)?(e[+-]?\d+)?)", text.lower())
+    if m:
+        try:
+            val = float(m.group(1))
+            if 1e14 <= val <= 1e22:
+                out["doping_conc"] = val
+        except:
+            pass
+
+    return out
+
+# ==================== 1) GPT CHAT ====================
+st.subheader("1) GPT Chat Input")
+
+chat_text = st.text_input(
+    "Describe the material (e.g., 'CdSe 3 nm er=9.5 WZ n-type doped with Si 2e18')"
+)
+
+use_gpt = st.toggle("Use GPT to parse input", value=bool(client))
+
+parsed = {
+    "material": None,
+    "radius_nm": None,
+    "epsilon_r": None,
+    "crystal_structure": None,
+    "dopant": None,
+    "doping_type": None,
+    "doping_conc": None
+}
+
+if chat_text:
+    if use_gpt and client:
+        prompt = f"""
+Extract the following fields from the text. Return ONLY JSON:
+material, radius_nm, epsilon_r, crystal_structure,
+dopant, doping_type, doping_conc.
+
+Text: "{chat_text}"
+"""
+
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = re.sub(r"```json|```", "", raw).strip()
+            parsed = json.loads(raw)
+        except:
+            parsed = parse_local(chat_text)
     else:
-        st.write(f"**AI:** {msg['content']}")
+        parsed = parse_local(chat_text)
 
-user_msg = st.text_input("Type your message here:")
+# ==================== 2) FORM INPUT ====================
+st.subheader("2) Structured Input")
 
-col_send = st.columns([1])[0]
-if col_send.button("Send", type="primary") and user_msg.strip():
+c1, c2 = st.columns(2)
 
-    # Add user message
-    st.session_state.chat_history.append({"role": "user", "content": user_msg})
+with c1:
+    material = st.text_input("Material", value=parsed["material"] or "CdSe")
+    radius_nm = st.number_input("Radius (nm)", 0.3, 30.0,
+                                value=float(parsed["radius_nm"] or 3.0))
 
-    # Generate GPT reply
-    reply = ""
-    try:
-        if OPENAI_API_KEY:
-            msgs = [{"role": "system", "content": "You are a helpful assistant for quantum dots."}]
-            msgs += st.session_state.chat_history
-            reply = call_gpt(msgs)
-        else:
-            reply = "GPT mode is disabled — no API key found in Streamlit secrets."
-    except Exception as e:
-        reply = f"GPT error: {e}"
+with c2:
+    epsilon_r = st.number_input("Dielectric Constant (εr)", 1.0, 100.0,
+                                value=float(parsed["epsilon_r"] or 9.5))
+    crystal_structure = st.selectbox(
+        "Crystal Structure",
+        ["ZB", "WZ", "Rocksalt", "Perovskite", "Rutile"],
+        index=["ZB", "WZ", "Rocksalt", "Perovskite", "Rutile"].index(
+            parsed["crystal_structure"] or "ZB"
+        )
+    )
 
-    st.session_state.chat_history.append({"role": "assistant", "content": reply})
-    st.rerun()   # FIXED — replaces deprecated experimental_rerun()
+# -------- DOPING --------
+st.subheader("Doping (Optional)")
 
-
-st.markdown("---")
-
-
-# =============================
-# 5) STRUCTURED USER INPUT FORM
-# =============================
-
-st.subheader("🧪 Structured Input")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    material = st.text_input("Material", "CdSe")
-    radius_nm = st.number_input("Radius (nm)", min_value=0.5, max_value=30.0, value=3.0, step=0.1)
-
-with col2:
-    epsilon_r = st.number_input("Dielectric Constant (εr)", min_value=1.0, max_value=50.0, value=9.5)
-    crystal_structure = st.selectbox("Crystal Structure", ["ZB", "WZ", "Rocksalt"], index=0)
-
-# ----- Doping -----
-st.subheader("Doping (optional)")
-d1, d2, d3 = st.columns([1,1,1])
+d1, d2, d3 = st.columns(3)
 
 with d1:
-    dopant = st.text_input("Dopant (e.g., B, P, In, Cu...)")
+    dopant = st.text_input("Dopant (e.g., B, Si, Mn)", value=parsed["dopant"] or "")
 
 with d2:
-    doping_type = st.selectbox("Type", ["", "n", "p"], index=0)
+    doping_type = st.selectbox(
+        "Type", ["", "n", "p"],
+        index=["", "n", "p"].index(parsed["doping_type"] or "")
+    )
 
 with d3:
-    doping_conc = st.number_input("Conc. (cm⁻³)", min_value=0.0, max_value=1e22,
-                                  value=0.0, step=1e16, format="%.2e")
+    doping_conc = st.number_input(
+        "Concentration (cm⁻³)",
+        min_value=0.0,
+        max_value=1e22,
+        value=float(parsed["doping_conc"] or 0.0),
+        step=1e16,
+        format="%.3e"
+    )
 
+# ==================== 3) FORWARD PREDICTION ====================
+st.subheader("3) Forward Prediction")
 
-# =============================
-# 6) FORWARD PREDICTION
-# =============================
+if st.button("Predict Band Gap"):
+    eg = system.predict_bandgap(
+        material, radius_nm, epsilon_r, crystal_structure,
+        dopant=dopant or None,
+        doping_type=doping_type or None,
+        doping_conc=doping_conc or None
+    )
 
-st.subheader("🎯 Forward Prediction")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Eg (eV)", f"{eg:.3f}")
+    c2.metric("Radius", f"{radius_nm:.2f} nm")
+    c3.metric("εr / Structure", f"{epsilon_r} / {crystal_structure}")
 
-if st.button("Predict Eg"):
-    try:
-        eg = system.predict_bandgap(
-            material,
-            radius_nm,
-            epsilon_r,
-            crystal_structure,
-            dopant if dopant.strip() else None,
-            doping_type if doping_type.strip() else None,
-            doping_conc if doping_conc > 0 else None
-        )
+# ==================== 4) INVERSE ====================
+st.subheader("4) Inverse Band Gap")
 
-        st.success(f"Predicted Band Gap: {eg:.3f} eV")
-
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-
-st.markdown("---")
-
-
-# =============================
-# 7) INVERSE SUGGESTIONS
-# =============================
-
-st.subheader("🔍 Inverse Suggestions (Top-K)")
-
-target = st.number_input("Target Eg (eV)", min_value=0.1, max_value=10.0, value=2.2, step=0.1)
+target = st.number_input("Target Eg (eV)", 0.0, 10.0, value=2.2)
 
 if st.button("Suggest Materials"):
-    try:
-        topk, nn_df = system.suggest_materials_from_bandgap(
-            target,
-            radius_nm,
-            epsilon_r,
-            crystal_structure,
-            top_k=3,
-            dopant=dopant if dopant else None,
-            doping_type=doping_type if doping_type else None,
-            doping_conc=doping_conc if doping_conc > 0 else None
-        )
+    top, df_hits = system.suggest_materials_from_bandgap(
+        target, radius_nm, epsilon_r, crystal_structure
+    )
 
-        st.write("### Best Matches")
-        for name, score in topk:
-            st.write(f"- **{name}** — score: {score*100:.1f}%")
+    st.write("Top Matches:")
+    for name, score in top:
+        st.write(f"• **{name}** — {score*100:.1f}%")
 
-        st.write("### Nearest Neighbors")
-        st.dataframe(nn_df)
+    st.write("Nearest Dataset Rows:")
+    st.dataframe(df_hits.reset_index(drop=True))
 
-    except Exception as e:
-        st.error(f"Inverse prediction failed: {e}")
-
-st.markdown("---")
-
-
-# =============================
-# 8) BAND GAP vs RADIUS CURVE
-# =============================
-
-st.subheader("📈 Band Gap vs Radius Curve")
+# ==================== 5) CURVE ====================
+st.subheader("5) Band Gap vs Radius Curve")
 
 if st.button("Generate Curve"):
-    try:
-        Rvals = np.linspace(1, 10, 40)
-        EG = [
-            system.predict_bandgap(
-                material,
-                float(r),
-                epsilon_r,
-                crystal_structure,
-                dopant if dopant else None,
-                doping_type if doping_type else None,
-                doping_conc if doping_conc > 0 else None
-            )
-            for r in Rvals
-        ]
+    Rvals = np.linspace(1, 10, 40)
+    Egvals = [
+        system.predict_bandgap(
+            material, float(r), epsilon_r, crystal_structure,
+            dopant=dopant or None,
+            doping_type=doping_type or None,
+            doping_conc=doping_conc or None
+        )
+        for r in Rvals
+    ]
 
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots()
-        ax.plot(Rvals, EG, linewidth=2)
-        ax.set_xlabel("Radius (nm)")
-        ax.set_ylabel("Band Gap (eV)")
-        ax.set_title(f"Eg vs Radius — {material}")
-        ax.grid(True)
-
-        st.pyplot(fig)
-
-    except Exception as e:
-        st.error(f"Plot failed: {e}")
+    fig, ax = plt.subplots()
+    ax.plot(Rvals, Egvals, linewidth=2)
+    ax.set_xlabel("Radius (nm)")
+    ax.set_ylabel("Eg (eV)")
+    ax.grid(True)
+    st.pyplot(fig)
