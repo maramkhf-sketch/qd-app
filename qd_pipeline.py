@@ -1,125 +1,76 @@
-# qd_pipeline.py — Clean Version (NO pymatgen)
+# qd_pipeline.py
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.neighbors import NearestNeighbors
-from sklearn.ensemble import RandomForestRegressor
+from joblib import load
 
 class QDSystem:
-    """
-    Hybrid ML + physics model
-    - Learns from the CSV dataset (materials & bandgaps)
-    - Predicts band gap for unseen materials using nearest neighbors
-    - Supports doping additively (optional)
-    """
+    def __init__(self, csv_path="qd_data.csv"):
+        self.df = pd.read_csv(csv_path)
 
-    def __init__(self):
-        self.encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-        self.model = RandomForestRegressor(n_estimators=200, random_state=42)
-        self.nn = None
-        self.df = None
+        # مواد النظام الأساسية
+        self.materials = sorted(self.df["material"].unique())
 
-    # -------------------------------------------------------
-    #                TRAIN MODEL ON CSV DATA
-    # -------------------------------------------------------
-    def fit(self, df: pd.DataFrame):
-        self.df = df.copy()
+        # ماب للكرستال
+        self.crystal_map = {"ZB": 0, "WZ": 1}
 
-        # Basic cleaned columns
-        X = df[["radius_nm", "epsilon_r"]].copy()
-        mat = df["material"].values.reshape(-1, 1)
+    # -------------------------------
+    # 1) أقرب مادة إذا اليوزر كتب مادة غير موجودة
+    # -------------------------------
+    def find_closest_material(self, user_material):
+        user_material = user_material.strip().lower()
+        best = None
+        best_score = -1
 
-        # Encode materials
-        mat_enc = self.encoder.fit_transform(mat)
+        for m in self.materials:
+            score = sum(a == b for a, b in zip(m.lower(), user_material))
+            if score > best_score:
+                best_score = score
+                best = m
+        return best
 
-        # Final ML input
-        X_full = np.hstack([X.values, mat_enc])
-        y = df["band_gap_eV"].values
+    # -------------------------------
+    # 2) الباند جاب الأساسي من الملف
+    # -------------------------------
+    def get_base_bandgap(self, material):
+        row = self.df[self.df["material"] == material]
+        if row.empty:
+            material = self.find_closest_material(material)
+            row = self.df[self.df["material"] == material]
+        return float(row["band_gap_eV"].values[0])
 
-        # Train regressor
-        self.model.fit(X_full, y)
+    # -------------------------------
+    # 3) تأثير الدوبنق
+    # -------------------------------
+    def doping_shift(self, dopant, doping_type, concentration):
+        if dopant.strip() == "":
+            return 0.0
 
-        # Build nearest-neighbors model for fallback
-        self.nn = NearestNeighbors(n_neighbors=3)
-        self.nn.fit(X_full)
+        concentration = max(float(concentration), 0)
 
-    # -------------------------------------------------------
-    #                INTERNAL ENCODING HELPER
-    # -------------------------------------------------------
-    def encode_input(self, material, radius_nm, epsilon_r):
-        """Encode inputs for the RF model."""
-        Xnum = np.array([[radius_nm, epsilon_r]])
-        Xmat = self.encoder.transform([[material]])  # (1, n_encoded)
-        return np.hstack([Xnum, Xmat])
+        if doping_type == "n-type":
+            return 0.04 * np.log10(concentration + 1)
+        elif doping_type == "p-type":
+            return -0.04 * np.log10(concentration + 1)
+        return 0.0
 
-    # -------------------------------------------------------
-    #            PREDICT BAND GAP (MAIN FORWARD)
-    # -------------------------------------------------------
-    def predict_bandgap(self, material, radius_nm, epsilon_r, crystal_structure=None,
-                        dopant=None, doping_type=None, doping_conc=None):
+    # -------------------------------
+    # 4) معادلة Brus + الدوبنق
+    # -------------------------------
+    def predict_bandgap(self, material, radius_nm, eps_r, crystal_structure,
+                        dopant="", doping_type="", concentration=0):
 
-        # 1) Encode input
-        try:
-            X = self.encode_input(material, radius_nm, epsilon_r)
-            base_pred = float(self.model.predict(X)[0])
-        except Exception:
-            # Material not seen -> fallback to NN on radius + epsilon only
-            base_pred = self._predict_with_neighbors(radius_nm, epsilon_r)
+        material = material if material in self.materials else self.find_closest_material(material)
 
-        # 2) Apply doping (optional)
-        doped_pred = self._apply_doping(base_pred, dopant, doping_type, doping_conc)
+        base_Eg = self.get_base_bandgap(material)
 
-        return doped_pred
+        r = float(radius_nm) * 1e-9
+        e2 = 1.44
+        eff_mass = 0.13
 
-    # -------------------------------------------------------
-    #       NN fallback method (for unknown materials)
-    # -------------------------------------------------------
-    def _predict_with_neighbors(self, radius_nm, epsilon_r):
-        """Fallback when material not in training set."""
-        # Just find NN using radius & epsilon only
-        df = self.df.copy()
-        df["dr"] = (df["radius_nm"] - radius_nm) ** 2
-        df["de"] = (df["epsilon_r"] - epsilon_r) ** 2
-        df["dist"] = np.sqrt(df["dr"] + df["de"])
+        brus = base_Eg + ((np.pi ** 2) * (6.626e-34**2)) / (2 * eff_mass * 9.11e-31 * r**2) \
+               - (1.8 * e2)/(eps_r * r * 1e9)
 
-        nearest = df.nsmallest(3, "dist")
-        return float(nearest["band_gap_eV"].mean())
+        delta = self.doping_shift(dopant, doping_type, concentration)
 
-    # -------------------------------------------------------
-    #             PHYSICS-INSPIRED DOPING EFFECT
-    # -------------------------------------------------------
-    def _apply_doping(self, Eg, dopant, doping_type, conc):
-
-        # No doping provided → return unchanged
-        if not dopant or not doping_type or not conc or conc <= 0:
-            return Eg
-
-        # Simple model: doping effect increases/decreases Eg slightly
-        # based on concentration (logarithmic scaling)
-        delta = 0
-
-        # n-type usually reduces band gap slightly
-        if doping_type == "n":
-            delta = -0.015 * np.log10(max(conc, 1))
-
-        # p-type usually increases band gap slightly
-        elif doping_type == "p":
-            delta = +0.015 * np.log10(max(conc, 1))
-
-        return float(Eg + delta)
-
-    # -------------------------------------------------------
-    #          INVERSE: suggest materials by target Eg
-    # -------------------------------------------------------
-    def suggest_materials_from_bandgap(self, target, radius_nm, epsilon_r, crystal_structure=None, top_k=3):
-
-        preds = []
-        for _, row in self.df.iterrows():
-            name = row["material"]
-            eg = self.predict_bandgap(name, radius_nm, epsilon_r, crystal_structure)
-            score = 1.0 / (1 + abs(eg - target))
-            preds.append((name, score))
-
-        preds_sorted = sorted(preds, key=lambda x: x[1], reverse=True)
-        return preds_sorted[:top_k], self.df
+        return float(brus + delta)
