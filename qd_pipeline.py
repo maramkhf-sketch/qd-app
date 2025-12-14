@@ -141,6 +141,23 @@ class QDSystem:
         return float(self.forward.predict(row)[0])
 
     # ---------------------------
+    # NEW: single-point Brus prediction (for ML vs Brus comparison)
+    def predict_brus_single(self, material, R, eps, structure):
+        # pull bulk/masses using SAME logic as hybrid_curve
+        df_m = self.train_df[self.train_df["material"] == material]
+        if len(df_m) > 0:
+            Eg_bulk = df_m["Eg_bulk_eV"].dropna().mean()
+            me = df_m["me_eff"].dropna().mean()
+            mh = df_m["mh_eff"].dropna().mean()
+            if pd.isna(Eg_bulk): Eg_bulk = 1.8
+            if pd.isna(me): me = 0.13
+            if pd.isna(mh): mh = 0.45
+        else:
+            Eg_bulk, me, mh = 1.8, 0.13, 0.45
+
+        return float(brus_Eg(np.array([R], dtype=float), Eg_bulk, me, mh, eps)[0])
+
+    # ---------------------------
     def predict_inverse(self, Eg, R, eps, structure):
         row = pd.DataFrame([{
             "band_gap_eV": Eg,

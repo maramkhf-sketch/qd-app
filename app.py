@@ -1,5 +1,6 @@
 # app.py — FULL VERSION
 # Chat GPT + Structured Input + Forward ML + Inverse (clean) + Hybrid B2 Curve
+# + NEW: ML vs Brus % difference (Forward section only)
 
 import os, re, json
 from pathlib import Path
@@ -179,17 +180,29 @@ st.markdown("---")
 
 
 # =====================================================
-# 3) FORWARD PREDICTION (ML)
+# 3) FORWARD PREDICTION (ML) + ML vs Brus comparison
 # =====================================================
 st.subheader("3) Forward Prediction")
 
 if st.button("Predict Band Gap"):
     try:
         Eg = system.predict_forward(material, radius, epsr, crystal)
+
         a, b, c = st.columns(3)
         a.metric("Predicted Eg", f"{Eg:.3f} eV")
         b.metric("Radius", f"{radius:.2f} nm")
         c.metric("εr / Structure", f"{epsr} / {crystal}")
+
+        # ---- NEW: compare ML with Brus baseline (what you requested)
+        Eg_brus = system.predict_brus_single(material, radius, epsr, crystal)
+        delta = Eg - Eg_brus
+        pct_diff = abs(delta) / (abs(Eg_brus) + 1e-12) * 100
+
+        d, e_, f = st.columns(3)
+        d.metric("Brus Eg (baseline)", f"{Eg_brus:.3f} eV")
+        e_.metric("ΔEg (ML - Brus)", f"{delta:.3f} eV")
+        f.metric("% Difference", f"{pct_diff:.2f}%")
+
     except Exception as e:
         st.error(str(e))
 
