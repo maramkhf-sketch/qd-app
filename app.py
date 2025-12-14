@@ -1,4 +1,5 @@
-# app.py — FULL VERSION (Chat GPT + Form + Forward + Inverse + Hybrid B2 Curve + Optional Doping)
+# app.py — FULL VERSION
+# Chat GPT + Structured Input + Forward ML + Inverse (clean) + Hybrid B2 Curve
 
 import os, re, json
 from pathlib import Path
@@ -53,7 +54,6 @@ system = load_or_train()
 # Helpers
 # ===========================
 def normalize_material(x):
-    """Normalize common user inputs like 'cdse' -> 'CdSe'."""
     if not x:
         return None
     s = str(x).strip()
@@ -66,8 +66,7 @@ def normalize_material(x):
         "wse2": "WSe2",
         "mose2": "MoSe2",
     }
-    key = s.lower()
-    return mapping.get(key, s)
+    return mapping.get(s.lower(), s)
 
 
 def parse_local(t):
@@ -83,39 +82,32 @@ def parse_local(t):
     if not t:
         return out
 
-    # material (allow lowercase too)
     m = re.search(r"\b([A-Za-z][A-Za-z0-9]{1,8})\b", t)
     if m:
         out["material"] = normalize_material(m.group(1))
 
-    # radius in nm
     m = re.search(r"(\d+(\.\d+)?)\s*nm", t, re.I)
     if m:
         out["radius_nm"] = float(m.group(1))
 
-    # epsilon_r
     m = re.search(r"(?:er|epsilon)\s*=?\s*(\d+(\.\d+)?)", t, re.I)
     if m:
         out["epsilon_r"] = float(m.group(1))
 
-    # crystal structure
     if re.search(r"\bwz\b", t, re.I):
         out["crystal_structure"] = "WZ"
     if re.search(r"\bzb\b", t, re.I):
         out["crystal_structure"] = "ZB"
 
-    # doping type
     if re.search(r"n-type", t, re.I):
         out["doping_type"] = "n"
     if re.search(r"p-type", t, re.I):
         out["doping_type"] = "p"
 
-    # dopant
     m = re.search(r"dop(?:ed|ing)?\s*with\s*([A-Za-z]{1,2})", t, re.I)
     if m:
         out["dopant"] = m.group(1).capitalize()
 
-    # concentration like 2e18, 1.5e+19
     m = re.search(r"(\d+(\.\d+)?e[+-]?\d+)", t, re.I)
     if m:
         out["doping_conc_cm3"] = float(m.group(1))
@@ -124,22 +116,22 @@ def parse_local(t):
 
 
 # =====================================================
-# 1) CHAT GPT INPUT
+# 1) CHAT INPUT
 # =====================================================
 st.subheader("1) Chat-style Input")
 
 left, right = st.columns([0.75, 0.25])
 with left:
-    chat_text = st.text_input("Example: 'cdse 3 nm er=9.5 wz, n-type, SI 2e18'")
+    chat_text = st.text_input("Example: 'cdse 3 nm er=9.5 zb'")
 with right:
     use_gpt = st.toggle("Use GPT", value=bool(client))
 
 if chat_text:
     if use_gpt and client:
         prompt = f"""
-You are extracting parameters for a quantum dot app.
-Return ONLY valid JSON (no markdown, no commentary) with these keys exactly:
-material, radius_nm, epsilon_r, crystal_structure, dopant, doping_type, doping_conc_cm3.
+Return ONLY valid JSON with keys:
+material, radius_nm, epsilon_r, crystal_structure,
+dopant, doping_type, doping_conc_cm3.
 Use null if missing.
 
 Text: "{chat_text}"
@@ -157,7 +149,6 @@ Text: "{chat_text}"
     else:
         parsed = parse_local(chat_text)
 
-    # normalize output
     parsed["material"] = normalize_material(parsed.get("material"))
 else:
     parsed = {k: None for k in ["material","radius_nm","epsilon_r","crystal_structure","dopant","doping_type","doping_conc_cm3"]}
@@ -166,7 +157,7 @@ st.markdown("---")
 
 
 # =====================================================
-# 2) STRUCTURED INPUT FORM
+# 2) STRUCTURED INPUT
 # =====================================================
 st.subheader("2) Structured Input")
 
@@ -184,28 +175,11 @@ with c2:
         index=["ZB","WZ","Rocksalt","Perovskite","Rutile"].index(parsed.get("crystal_structure") or "ZB")
     )
 
-# DOPING
-st.subheader("Doping (Optional)")
-
-d1, d2, d3 = st.columns([0.4, 0.3, 0.3])
-with d1:
-    dopant = st.text_input("Dopant:", value=(parsed.get("dopant") or ""))
-with d2:
-    dtype = st.selectbox("Type:", ["", "n", "p"], index=["", "n", "p"].index(parsed.get("doping_type") or ""))
-with d3:
-    dconc = st.number_input(
-        "Conc (cm⁻³):",
-        0.0,
-        1e22,
-        float(parsed.get("doping_conc_cm3") or 0.0),
-        format="%.3e"
-    )
-
 st.markdown("---")
 
 
 # =====================================================
-# 3) FORWARD PREDICTION
+# 3) FORWARD PREDICTION (ML)
 # =====================================================
 st.subheader("3) Forward Prediction")
 
@@ -214,11 +188,8 @@ if st.button("Predict Band Gap"):
         Eg = system.predict_forward(material, radius, epsr, crystal)
         a, b, c = st.columns(3)
         a.metric("Predicted Eg", f"{Eg:.3f} eV")
-        b.metric("Radius", f"{radius:.2f}")
-        c.metric("εr / Str", f"{epsr}/{crystal}")
-
-        if dopant or dtype or dconc:
-            st.caption(f"Doping: {dopant or '—'} / {dtype or '—'} / {dconc:.2e}")
+        b.metric("Radius", f"{radius:.2f} nm")
+        c.metric("εr / Structure", f"{epsr} / {crystal}")
     except Exception as e:
         st.error(str(e))
 
@@ -226,7 +197,7 @@ st.markdown("---")
 
 
 # =====================================================
-# 4) INVERSE
+# 4) INVERSE SUGGESTIONS (CLEAN)
 # =====================================================
 st.subheader("4) Inverse Suggestions")
 
@@ -238,16 +209,10 @@ with ic1:
 
 if run_inv:
     try:
-        topk, nn = system.predict_inverse(targetEg, radius, epsr, crystal)
+        topk, _ = system.predict_inverse(targetEg, radius, epsr, crystal)
 
         for rank, (name, score) in enumerate(topk, start=1):
-            st.write(f"**#{rank} — {name}**  (score {score*100:.1f}%)")
-
-        # Hide dataset preview by default
-        show_debug = st.toggle("Show nearest matches (debug)", value=False)
-        if show_debug:
-            st.write("Nearest Matches:")
-            st.dataframe(nn.reset_index(drop=True))
+            st.write(f"**#{rank} — {name}**  (confidence {score*100:.1f}%)")
 
     except Exception as e:
         st.error(str(e))
@@ -265,14 +230,15 @@ if st.button("Generate Curve"):
         R, Eg_ml, Eg_phys, Eg_hybrid = system.hybrid_curve(material, epsr, crystal)
 
         fig, ax = plt.subplots()
-        ax.plot(R, Eg_ml, label="ML", linewidth=2)
-        ax.plot(R, Eg_phys, label="Brus Phys", linestyle="--")
+        ax.plot(R, Eg_ml, label="ML Prediction", linewidth=2)
+        ax.plot(R, Eg_phys, label="Brus Physical Model", linestyle="--")
         ax.plot(R, Eg_hybrid, label="Hybrid B2", linewidth=3)
+
         ax.set_xlabel("Radius (nm)")
-        ax.set_ylabel("Eg (eV)")
+        ax.set_ylabel("Band Gap (eV)")
         ax.grid(True)
         ax.legend()
         st.pyplot(fig)
+
     except Exception as e:
         st.error(str(e))
-
