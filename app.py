@@ -1,8 +1,8 @@
-# app.py — FULL VERSION
-# Forward ML + Inverse + Hybrid Curve + ML vs Brus comparison
-# Doping info is parsed & displayed ONLY (not used in calculation)
+# app.py — FINAL VERSION
+# Forward ML + Inverse + Hybrid Curve
+# Doping inputs are STRUCTURED + optional (reference only)
 
-import os, re, json
+import os, re
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -103,8 +103,9 @@ def parse_local(t):
 # 1) CHAT INPUT
 # =====================================================
 st.subheader("1) Chat-style Input")
-
-chat_text = st.text_input("Example: CdSe 3 nm er=9.5 ZB n-type doped with P")
+chat_text = st.text_input(
+    "Example: CdSe 3 nm er=9.5 ZB n-type doped with P"
+)
 
 parsed = parse_local(chat_text)
 parsed["material"] = normalize_material(parsed.get("material"))
@@ -143,24 +144,53 @@ with c2:
         index=["ZB", "WZ"].index(parsed.get("crystal_structure") or "ZB")
     )
 
-# ===========================
-# DOPING INFO (DISPLAY ONLY)
-# ===========================
-st.subheader("Doping Information (reference only)")
+# =====================================================
+# 3) DOPING INPUTS (STRUCTURED)
+# =====================================================
+st.subheader("3) Doping Inputs (optional)")
 
 d1, d2, d3 = st.columns(3)
-d1.write(f"**Dopant:** {parsed.get('dopant') or '—'}")
-d2.write(f"**Type:** {parsed.get('doping_type') or '—'}")
-d3.write(f"**Concentration (cm⁻³):** {parsed.get('doping_conc_cm3') or '—'}")
 
-st.caption("ℹ️ Doping information is displayed for reference only and is not used in the prediction model.")
+with d1:
+    dopant = st.text_input(
+        "Dopant (e.g., P, N, B):",
+        value=parsed.get("dopant") or ""
+    )
+
+with d2:
+    doping_type = st.selectbox(
+        "Type:",
+        ["—", "n", "p"],
+        index=["—", "n", "p"].index(
+            parsed.get("doping_type")
+            if parsed.get("doping_type") in ["n", "p"] else "—"
+        )
+    )
+
+with d3:
+    use_conc = st.checkbox(
+        "Add concentration",
+        value=parsed.get("doping_conc_cm3") is not None
+    )
+    doping_conc_cm3 = st.number_input(
+        "Concentration (cm⁻³):",
+        min_value=0.0,
+        value=float(parsed.get("doping_conc_cm3") or 0.0),
+        step=1e15,
+        format="%.3e",
+        disabled=not use_conc
+    )
+
+st.caption(
+    "ℹ️ Doping inputs are for reference only and are NOT used in the prediction model."
+)
 
 st.markdown("---")
 
 # =====================================================
-# 3) FORWARD PREDICTION
+# 4) FORWARD PREDICTION
 # =====================================================
-st.subheader("3) Forward Prediction (ML)")
+st.subheader("4) Forward Prediction (ML)")
 
 if st.button("Predict Band Gap"):
     Eg_ml = system.predict_forward(material, radius, epsr, crystal)
@@ -177,11 +207,14 @@ if st.button("Predict Band Gap"):
 st.markdown("---")
 
 # =====================================================
-# 4) INVERSE PREDICTION
+# 5) INVERSE PREDICTION
 # =====================================================
-st.subheader("4) Inverse Prediction")
+st.subheader("5) Inverse Prediction")
 
-targetEg = st.number_input("Target Band Gap (eV):", 0.0, 10.0, 2.2, 0.05)
+targetEg = st.number_input(
+    "Target Band Gap (eV):",
+    0.0, 10.0, 2.2, 0.05
+)
 
 if st.button("Suggest Materials"):
     topk, _ = system.predict_inverse(targetEg, radius, epsr, crystal)
@@ -191,12 +224,14 @@ if st.button("Suggest Materials"):
 st.markdown("---")
 
 # =====================================================
-# 5) HYBRID CURVE PLOTTING
+# 6) HYBRID CURVE
 # =====================================================
-st.subheader("5) Band Gap vs Radius (Hybrid Model)")
+st.subheader("6) Band Gap vs Radius (Hybrid Model)")
 
 if st.button("Generate Curve"):
-    R, Eg_ml, Eg_phys, Eg_hybrid = system.hybrid_curve(material, epsr, crystal)
+    R, Eg_ml, Eg_phys, Eg_hybrid = system.hybrid_curve(
+        material, epsr, crystal
+    )
 
     fig, ax = plt.subplots()
     ax.plot(R, Eg_ml, label="ML Prediction")
