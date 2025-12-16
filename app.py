@@ -1,8 +1,9 @@
-# app.py — FINAL VERSION
-# Forward ML + Inverse + Hybrid Curve
-# Doping inputs are STRUCTURED + optional (reference only)
+# app.py — FULL VERSION (like before) + STRUCTURED DOPING INPUTS
+# Chat GPT + Structured Input + Forward ML + Inverse + Hybrid B2 Curve
+# + ML vs Brus % difference (Forward section only)
+# NOTE: Doping inputs are DISPLAY/REFERENCE ONLY (not used in calculations)
 
-import os, re
+import os, re, json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -13,7 +14,19 @@ import joblib
 from qd_pipeline import QDSystem
 
 # ===========================
-# UI CONFIG
+# GPT
+# ===========================
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        client = None
+
+# ===========================
+# UI
 # ===========================
 st.set_page_config(page_title="QD Predictor", page_icon="🧠", layout="centered")
 st.title("🧠 Quantum Dot Band Gap Predictor")
@@ -23,21 +36,21 @@ MODEL_PATH = HERE / "qd_system.joblib"
 DATA_PATH = HERE / "qd_data.csv"
 
 # ===========================
-# LOAD / TRAIN SYSTEM
+# Load / Train
 # ===========================
 @st.cache_resource(show_spinner=True)
 def load_or_train():
     if MODEL_PATH.exists():
         return joblib.load(MODEL_PATH)
     df = pd.read_csv(DATA_PATH)
-    system = QDSystem().fit(df)
-    joblib.dump(system, MODEL_PATH)
-    return system
+    sys = QDSystem().fit(df)
+    joblib.dump(sys, MODEL_PATH)
+    return sys
 
 system = load_or_train()
 
 # ===========================
-# HELPERS
+# Helpers
 # ===========================
 def normalize_material(x):
     if not x:
@@ -62,7 +75,7 @@ def parse_local(t):
         "crystal_structure": None,
         "dopant": None,
         "doping_type": None,
-        "doping_conc_cm3": None,
+        "doping_conc_cm3": None
     }
     if not t:
         return out
@@ -93,9 +106,13 @@ def parse_local(t):
     if m:
         out["dopant"] = m.group(1).capitalize()
 
+    # scientific notation like 1e18, 2.5e+19, etc.
     m = re.search(r"(\d+(\.\d+)?e[+-]?\d+)", t, re.I)
     if m:
-        out["doping_conc_cm3"] = float(m.group(1))
+        try:
+            out["doping_conc_cm3"] = float(m.group(1))
+        except Exception:
+            out["doping_conc_cm3"] = None
 
     return out
 
@@ -103,12 +120,39 @@ def parse_local(t):
 # 1) CHAT INPUT
 # =====================================================
 st.subheader("1) Chat-style Input")
-chat_text = st.text_input(
-    "Example: CdSe 3 nm er=9.5 ZB n-type doped with P"
-)
 
-parsed = parse_local(chat_text)
-parsed["material"] = normalize_material(parsed.get("material"))
+left, right = st.columns([0.75, 0.25])
+with left:
+    chat_text = st.text_input("Example: 'cdse 3 nm er=9.5 zb n-type doped with P 1e18'")
+with right:
+    use_gpt = st.toggle("Use GPT", value=bool(client))
+
+if chat_text:
+    if use_gpt and client:
+        prompt = f"""
+Return ONLY valid JSON with keys:
+material, radius_nm, epsilon_r, crystal_structure,
+dopant, doping_type, doping_conc_cm3.
+Use null if missing.
+
+Text: "{chat_text}"
+"""
+        try:
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            parsed = json.loads(r.choices[0].message.content)
+        except Exception:
+            parsed = parse_local(chat_text)
+    else:
+        parsed = parse_local(chat_text)
+
+    parsed["material"] = normalize_material(parsed.get("material"))
+else:
+    parsed = {k: None for k in ["material","radius_nm","epsilon_r","crystal_structure","dopant","doping_type","doping_conc_cm3"]}
 
 st.markdown("---")
 
@@ -120,58 +164,36 @@ st.subheader("2) Structured Input")
 c1, c2 = st.columns(2)
 
 with c1:
-    material = st.text_input(
-        "Material:",
-        value=parsed.get("material") or "CdSe"
-    )
-    radius = st.number_input(
-        "Radius (nm):",
-        0.3, 30.0,
-        float(parsed.get("radius_nm") or 3.0),
-        0.1
-    )
+    material = st.text_input("Material:", value=(parsed.get("material") or "CdSe"))
+    radius = st.number_input("Radius (nm):", 0.3, 30.0, float(parsed.get("radius_nm") or 3.0), 0.1)
 
 with c2:
-    epsr = st.number_input(
-        "Dielectric Constant (εr):",
-        1.0, 100.0,
-        float(parsed.get("epsilon_r") or 9.5),
-        0.1
-    )
+    epsr = st.number_input("Dielectric Constant:", 1.0, 100.0, float(parsed.get("epsilon_r") or 9.5), 0.1)
     crystal = st.selectbox(
-        "Crystal Structure:",
-        ["ZB", "WZ"],
-        index=["ZB", "WZ"].index(parsed.get("crystal_structure") or "ZB")
+        "Crystal:",
+        ["ZB","WZ","Rocksalt","Perovskite","Rutile"],
+        index=["ZB","WZ","Rocksalt","Perovskite","Rutile"].index(parsed.get("crystal_structure") or "ZB")
     )
 
 # =====================================================
-# 3) DOPING INPUTS (STRUCTURED)
+# 3) DOPING INPUTS (STRUCTURED) — NEW
 # =====================================================
 st.subheader("3) Doping Inputs (optional)")
 
 d1, d2, d3 = st.columns(3)
 
 with d1:
-    dopant = st.text_input(
-        "Dopant (e.g., P, N, B):",
-        value=parsed.get("dopant") or ""
-    )
+    dopant = st.text_input("Dopant (e.g., P, N, B):", value=(parsed.get("dopant") or ""))
 
 with d2:
     doping_type = st.selectbox(
-        "Type:",
+        "Doping type:",
         ["—", "n", "p"],
-        index=["—", "n", "p"].index(
-            parsed.get("doping_type")
-            if parsed.get("doping_type") in ["n", "p"] else "—"
-        )
+        index=["—", "n", "p"].index(parsed.get("doping_type") if parsed.get("doping_type") in ["n","p"] else "—")
     )
 
 with d3:
-    use_conc = st.checkbox(
-        "Add concentration",
-        value=parsed.get("doping_conc_cm3") is not None
-    )
+    use_conc = st.checkbox("Add concentration", value=parsed.get("doping_conc_cm3") is not None)
     doping_conc_cm3 = st.number_input(
         "Concentration (cm⁻³):",
         min_value=0.0,
@@ -181,66 +203,87 @@ with d3:
         disabled=not use_conc
     )
 
-st.caption(
-    "ℹ️ Doping inputs are for reference only and are NOT used in the prediction model."
-)
+st.caption("ℹ️ Doping inputs are captured and displayed only (not used in prediction calculations).")
 
 st.markdown("---")
 
 # =====================================================
-# 4) FORWARD PREDICTION
+# 4) FORWARD PREDICTION (ML) + ML vs Brus comparison
 # =====================================================
-st.subheader("4) Forward Prediction (ML)")
+st.subheader("4) Forward Prediction")
 
 if st.button("Predict Band Gap"):
-    Eg_ml = system.predict_forward(material, radius, epsr, crystal)
-    Eg_brus = system.predict_brus_single(material, radius, epsr, crystal)
+    try:
+        Eg = system.predict_forward(material, radius, epsr, crystal)
 
-    delta = Eg_ml - Eg_brus
-    pct = abs(delta) / (abs(Eg_brus) + 1e-12) * 100
+        a, b, c = st.columns(3)
+        a.metric("Predicted Eg (ML)", f"{Eg:.3f} eV")
+        b.metric("Radius", f"{radius:.2f} nm")
+        c.metric("εr / Structure", f"{epsr} / {crystal}")
 
-    a, b, c = st.columns(3)
-    a.metric("ML Predicted Eg", f"{Eg_ml:.3f} eV")
-    b.metric("Brus Eg", f"{Eg_brus:.3f} eV")
-    c.metric("ΔEg (%)", f"{pct:.2f} %")
+        # Compare ML with Brus baseline
+        Eg_brus = system.predict_brus_single(material, radius, epsr, crystal)
+        delta = Eg - Eg_brus
+        pct_diff = abs(delta) / (abs(Eg_brus) + 1e-12) * 100
+
+        d, e_, f = st.columns(3)
+        d.metric("Brus Eg (baseline)", f"{Eg_brus:.3f} eV")
+        e_.metric("ΔEg (ML - Brus)", f"{delta:.3f} eV")
+        f.metric("% Difference", f"{pct_diff:.2f}%")
+
+        # Optional: show the doping inputs as a summary (still not used in calc)
+        with st.expander("Show Doping (reference)"):
+            st.write(f"**Dopant:** {dopant or '—'}")
+            st.write(f"**Type:** {doping_type}")
+            st.write(f"**Concentration (cm⁻³):** {doping_conc_cm3:.3e}" if use_conc else "**Concentration (cm⁻³):** —")
+
+    except Exception as e:
+        st.error(str(e))
 
 st.markdown("---")
 
 # =====================================================
-# 5) INVERSE PREDICTION
+# 5) INVERSE SUGGESTIONS
 # =====================================================
-st.subheader("5) Inverse Prediction")
+st.subheader("5) Inverse Suggestions")
 
-targetEg = st.number_input(
-    "Target Band Gap (eV):",
-    0.0, 10.0, 2.2, 0.05
-)
+ic1, ic2 = st.columns([1, 1])
+with ic2:
+    targetEg = st.number_input("Target Eg (eV):", 0.0, 10.0, 2.2, 0.05)
+with ic1:
+    run_inv = st.button("Suggest Materials")
 
-if st.button("Suggest Materials"):
-    topk, _ = system.predict_inverse(targetEg, radius, epsr, crystal)
-    for i, (name, prob) in enumerate(topk, 1):
-        st.write(f"**#{i} — {name}** (confidence {prob*100:.1f}%)")
+if run_inv:
+    try:
+        topk, _ = system.predict_inverse(targetEg, radius, epsr, crystal)
+
+        for rank, (name, score) in enumerate(topk, start=1):
+            st.write(f"**#{rank} — {name}**  (confidence {score*100:.1f}%)")
+
+    except Exception as e:
+        st.error(str(e))
 
 st.markdown("---")
 
 # =====================================================
-# 6) HYBRID CURVE
+# 6) HYBRID B2 CURVE
 # =====================================================
-st.subheader("6) Band Gap vs Radius (Hybrid Model)")
+st.subheader("6) Band Gap vs Radius Curve (Hybrid B2)")
 
 if st.button("Generate Curve"):
-    R, Eg_ml, Eg_phys, Eg_hybrid = system.hybrid_curve(
-        material, epsr, crystal
-    )
+    try:
+        R, Eg_ml, Eg_phys, Eg_hybrid = system.hybrid_curve(material, epsr, crystal)
 
-    fig, ax = plt.subplots()
-    ax.plot(R, Eg_ml, label="ML Prediction")
-    ax.plot(R, Eg_phys, "--", label="Brus Model")
-    ax.plot(R, Eg_hybrid, linewidth=3, label="Hybrid Model")
+        fig, ax = plt.subplots()
+        ax.plot(R, Eg_ml, label="ML Prediction", linewidth=2)
+        ax.plot(R, Eg_phys, label="Brus Physical Model", linestyle="--")
+        ax.plot(R, Eg_hybrid, label="Hybrid B2", linewidth=3)
 
-    ax.set_xlabel("Radius (nm)")
-    ax.set_ylabel("Band Gap (eV)")
-    ax.legend()
-    ax.grid(True)
+        ax.set_xlabel("Radius (nm)")
+        ax.set_ylabel("Band Gap (eV)")
+        ax.grid(True)
+        ax.legend()
+        st.pyplot(fig)
 
-    st.pyplot(fig)
+    except Exception as e:
+        st.error(str(e))
